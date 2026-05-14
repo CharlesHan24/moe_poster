@@ -388,7 +388,7 @@ Our preliminary implementation of \sysname consists of two core components: an M
     \vspace{-0.2cm}
     \caption{\sysname's throughput in tokens per second (TPS) and TPOT in seconds per output token compared with vLLM and HF. In Figures (a) and (c), the batch size is $16$ requests and we vary the available GPU memory size relative to the model parameter size (${\sim}60 $GB for Qwen3-30B-A3B~\cite{yang2025qwen3, qwen2025qwen330ba3b}). In Figure (b) and (d) we fix the available GPU memory size as $30$GB and vary the batch size from 16 to 64.}
     \label{fig:performance-comparison}
-    \vspace{-0.3cm}
+    \vspace{-0.2cm}
 \end{figure}
 
 \smallskip
@@ -417,7 +417,7 @@ Preliminary measurements show that running the predictors during inference adds 
 \subp{End to end inference performance.} As Figure~\ref{fig:performance-comparison} indicates, \sysname achieves substantial improvement in both throughput in tokens-per-second (TPS) and inference latency in time-per-output-token (TPOT) over two state-of-the-art inference frameworks, namely, vLLM and Huggingface. 
 Across different GPU memory sizes, \sysname improves over vLLM's and HuggingFace's TPS by $2.26 \sim 3.02\times$ and $18.23 \sim 25.18\times$ respectively; across different batch sizes, \sysname improves over vLLM's and HuggingFace's TPOT by $ 2.74 \sim 3.02\times$ and $18.23 \sim 28.62 \times$ respectively. Our analysis reveals that this improvement is mainly attributable to significantly reduced CPU-to-GPU copy traffic. For example, with a $16$-batch size and $50\%$ GPU memory, \sysname loads on average $\approx2.2\%$ of experts, while vLLM loads $\approx10.63\%$ and HF loads$\approx 50\%$. 
 
-\begin{figure}[h!]
+\begin{figure}[]
     \centering
     \vspace{0.1in}
     \hspace{-0.15cm}
