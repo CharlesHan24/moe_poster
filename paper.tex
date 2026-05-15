@@ -188,7 +188,7 @@
 
 \author{Ran Ben Basat}
 \affiliation{%
-  \institution{University College London}%
+  \institution{University College London and Broadcom}%
   % \city{London}
   \country{}%  
 }  
@@ -197,39 +197,49 @@
 
 \begin{abstract}
 Mixture-of-Experts (MoE) models improve scaling by activating a small number of experts per token. 
-However, the combined memory requirements of all experts may exceed the available GPU high bandwidth memory (HBM) during serving. 
-Inference frameworks such as vLLM and HuggingFace address the problem by offloading inactive experts to CPU memory and moving them to the GPU's HBM as needed. While enabling inference of large models on limited HBM setups, this CPU-GPU traffic overhead slows token generation speed substantially.
+However, the combined memory requirements of all experts may exceed the GPU's available high-bandwidth memory (HBM) during Inference. 
+Inference frameworks such as vLLM and HuggingFace address the problem by offloading experts to CPU memory and moving them to the GPU's HBM as needed. While enabling inference of large models with limited HBM, this CPU-GPU \mbox{traffic overhead slows down token generation.} 
 
-We present \sys, a correctness-preserving prefetching and eviction policy for MoE offloading. 
-\sys leverages a lightweight predictor to assess which experts assess which experts are most likely to be required for prefetching and ranks experts by their likelihood of near-future for eviction. Preliminary evaluation over the Qwen3-30B-A3B model and the MMLU-Pro dataset indicates that \sys reduces the TPOT of vLLM and HuggingFace by up to $3.02\times$ and $28.62\times$ respectively.
+We present \sys, a novel prefetching and eviction framework for MoE offloading. 
+\sys uses a lightweight predictor to assess which experts are most likely to be required for prefetching and ranks experts by their near-future activation likelihood for eviction. Preliminary evaluation over the Qwen3-30B-A3B model and the MMLU-Pro dataset indicates that \sys reduces the TPOT of vLLM and \mbox{HuggingFace by up to $3.02\times$ and $28.62\times$~respectively.}
 \end{abstract}
 
 \maketitle
+\vspace{-0.02468106in}
 
 \section{Introduction}
-MoE layers route each token to a small expert subset, enabling larger parameter counts for the same HBM size~\cite{shazeer2017outrageously,fedus2022switch,jiang2024mixtral}. The serving challenge is that expert parameters dominate memory: computation uses only a few experts at once, yet all experts must reside somewhere. When active experts do not fit in GPU memory, \emph{MoE offloading} keeps a subset on GPU and the rest in CPU memory, loading experts on demand. This CPU-GPU traffic often dominates token generation.
+% MoE layers route each token to a small expert subset, enabling larger parameter counts for the same HBM size~\cite{shazeer2017outrageously,fedus2022switch,jiang2024mixtral}. The serving challenge is that expert parameters dominate memory: computation uses only a few experts at once, yet all experts must reside somewhere. When active experts do not fit in GPU memory, \emph{MoE offloading} keeps a subset on GPU and the rest in CPU memory, loading experts on demand. This CPU-GPU traffic often dominates token generation.
 
-This is naturally a prefetching-caching problem: prefetch experts likely to be useful soon, and evict experts to make room. Misses are costly because an MoE layer stalls until weights arrive over the CPU--GPU interconnect.
+MoE layers route each token to a small expert subset, enabling larger parameter counts for the same HBM size~\cite{shazeer2017outrageously,fedus2022switch,jiang2024mixtral}. The challenge is that experts dominate memory: only a few are used per token, yet all must reside somewhere. When experts do not fit in GPU memory, \emph{MoE offloading} keeps a subset on GPU and the rest in CPU memory, loading experts on demand. This CPU-GPU PCIe traffic dominates token generation due to its limited bandwidth~\cite{nvidia_cuda_best_practices}.
 
-Prior systems show the promise of expert offloading, prefetching, and predictive routing \cite{eliseev2023fast,du2024sida,he2026expertflow}, but eviction often overlooks autoregressive structure or changes system behavior, e.g., by modifying expert selection.
+This is naturally a prefetching-eviction problem: prefetch experts likely to be useful soon, and evict others to make room. Misses are costly since an MoE layer stalls until missing experts arrive over the CPU--GPU interconnect.
+%
+Prior systems consider expert offloading, prefetching, and predictive routing \cite{eliseev2023fast,du2024sida,he2026expertflow}, but their eviction overlooks the autoregressive structure or they modify the \mbox{routers' expert selection.}
 
-We profile expert activation patterns and build a real-time predictor of each expert's near-future demand. \sys uses these predictions for prefetching and eviction while preserving correctness by serving exactly the router-selected experts and reducing CPU-GPU traffic.
+To address this gap, we profile expert activation and build real-time predictors of each expert's near-future activation pattern. Then we present \sys, a novel MoE offloading framework that uses these predictions for prefetching and eviction, while serving only the router-selected experts and reducing CPU-GPU traffic.
 
-In preliminary evaluation with Qwen3-30B-A3B~\cite{qwen2025qwen330ba3b} on MMLU-Pro~\cite{wang2024mmlupro}, varying GPU memory and batch size up to $64$, \sysname outperforms vLLM~\cite{kwon2023vllm} and HuggingFace~\cite{wolf2019huggingface} by $2.26\sim 3.02\times$ and $18.23 \sim 28.62\times$, respectively.
+Preliminary evaluation with Qwen3-30B-A3B~\cite{qwen2025qwen330ba3b} on MMLU-Pro~\cite{wang2024mmlupro}, varying GPU memory and batch size up to $64$ shows that \sysname outperforms vLLM~\cite{kwon2023vllm} and HuggingFace~\cite{wolf2019huggingface} by $2.26\sim 3.02\times$ and $18.23 \sim 28.62\times$, respectively.
 
-
+\vspace{-2mm}
 \section{\sysname Design}
-\subsection{Problem formulation}
-We formulate MoE offloading as online prefetching and caching. The GPU stores a subset of expert weights, CPU memory stores every expert, and \sys tries to keep the original router-selected experts resident on GPU when needed without changing routing.
+\vspace{-.5mm}
+\textbf{Problem formulation.}
+We formulate MoE offloading as an online prefetching and eviction problem over a constrained host-device interconnect.
+The GPU memory stores a subset of experts, while CPU memory stores a
+copy of every expert. The goal of \sys is not to change the model's
+routing decisions, but to minimize the communication overhead from moving experts on the CPU to the GPU when needed. 
+
+%router resident on GPU when they are needed.
 
 
-Let $\mathcal{L}$ be the MoE layers. Each layer $\ell\in\mathcal{L}$ contains a disjoint expert set $\mathcal{E}_\ell$, and $\mathcal{X}=\bigcup_\ell \mathcal{E}_\ell$ is the full expert set. During autoregressive decoding, let $\mathcal{T}$ be the generation steps, $t\in\mathcal{T}$ one step, and $\mathcal{B}_t$ the active requests at step $t$.
+Let $\mathcal{L}$ be the MoE layers. Each layer $\ell\in\mathcal{L}$ contains a disjoint expert set $\mathcal{E}_\ell$, and $\mathcal{X}=\bigcup_\ell \mathcal{E}_\ell$ is the full expert set. During autoregressive decoding, let $\mathcal{T}$ be the generation steps, $t\in\mathcal{T}$ be one step, and $\mathcal{B}_t$ the active requests at step $t$.
 
 For each $b\in\mathcal{B}_t$, layer $\ell$, and step $t$, the router selects $\mathcal{A}_{b,t,\ell}\subseteq \mathcal{E}_\ell$; the batch-level active set is $\mathcal{A}_{t,\ell}=\bigcup_{b\in\mathcal{B}_t}\mathcal{A}_{b,t,\ell}$.
 
-Let $\mathcal{C}^{-}_{t,\ell}\subseteq\mathcal{X}$ be the experts resident on GPU immediately before layer $\ell$ computes at step $t$, after prefetches but before loading required missing experts. Thus $\mathcal{A}_{t,\ell}\setminus \mathcal{C}^{-}_{t,\ell}$ must be loaded from CPU memory; such misses preserve correctness but add latency.
+Let $\mathcal{C}^{-}_{t,\ell}\subseteq\mathcal{X}$ be the experts resident on GPU immediately before layer $\ell$ computes at step $t$, after prefetches but before loading required missing experts. Thus $\mathcal{A}_{t,\ell}\setminus \mathcal{C}^{-}_{t,\ell}$ must be loaded from CPU; this preserves \mbox{correctness but adds latency.}
 
-After the current layer's expert computation begins, the system may prefetch experts predicted useful for future layer-step pairs $(t',\ell')$. If the cache exceeds capacity $C$, eviction removes inactive resident experts; active experts cannot be replaced. Our goal is to minimize miss-induced transfer time:
+After the current layer's expert computation begins, the system may prefetch experts predicted useful for future layer-step pairs $(t',\ell')$. If we exceeds capacity $C$, eviction removes inactive resident experts; active experts cannot be removed. Our goal is to minimize miss-induced transfer time:
+\vspace{-.5mm}
 \begin{equation*}
 \label{eq:cache-objective}
 \min_{\pi}\;
@@ -239,56 +249,65 @@ After the current layer's expert computation begins, the system may prefetch exp
 w_x \cdot \left(x\notin\mathcal{C}^{-}_{t,\ell}\right),
 \quad
 \text{s.t.}\quad
-|\mathcal{C}_{t,\ell}|\le C .
+|\mathcal{C}_{t,\ell}|\le C ,
 \end{equation*}
+\vspace{-.5mm}
+%
+where $w_x$ is the transfer cost for expert $x$. Assuming equal-size experts and a common transfer path makes $w_x$ constant, reducing the objective to \mbox{minimizing expert misses.}
 
+First, the objective abstracts transfer costs that may vary with expert size, GPU placement, bandwidth, and locality; nonuniform $w_x$ can model this. Second, prefetched-but-unused experts are not charged separately, which is reasonable when bounded prefetch traffic overlaps with computation. A false prefetch still consumes capacity and can increase future misses; we plan to consider these as future work.
 
+\textbf{Expert activation patterns.}\label{sec:expert_activation_patterns}
+%
+\sys leverages three MoE-routing properties, consistent with prior work~\cite{wang2025harnessing, zhou2022mixture}. First, each request and layer activates only a small, usually fixed-size subset: $\mathcal{A}_{b,t,\ell}\subseteq \mathcal{E}_\ell$ where $|\mathcal{A}_{b,t,\ell}| \ll |\mathcal{E}_\ell|$. Routing is also skewed: many batch requests select overlapping experts, so $\mathcal{A}_{t,\ell}$ is often much smaller than $\mathcal{E}_\ell$.
 
-Here, $w_x$ is the blocking CPU-to-GPU transfer cost for expert $x$. Assuming equal-size experts and a common transfer path makes $w_x$ constant, reducing the objective to minimizing expert misses.
-
-The objective abstracts two lower-level effects. First, load costs may vary with expert size, GPU placement, bandwidth, and locality; nonuniform $w_x$ can model this. Second, prefetched-but-unused experts are not charged separately, which is reasonable when bounded prefetch traffic overlaps computation. False prefetches still consume capacity and can increase future misses; we leave richer models to future work.
-
-\subsection{Expert activation patterns}\label{sec:expert_activation_patterns}
-
-\sys uses three MoE-routing properties, consistent with prior observations~\cite{wang2025harnessing, zhou2022mixture}. First, each request and layer activates only a small, usually fixed-size subset: $\mathcal{A}_{b,t,\ell}\subseteq \mathcal{E}_\ell$ and $|\mathcal{A}_{b,t,\ell}| \ll |\mathcal{E}_\ell|$. Routing is also skewed: many batch requests select overlapping experts, so $\mathcal{A}_{t,\ell}$ is often much smaller than $\mathcal{E}_\ell$.
-
-Second, decode steps exhibit temporal locality. For fixed layer $\ell$, the active set at one generation step often overlaps nearby steps, making $\mathcal{A}_{t,\ell}$ predictive of future active sets. Thus recent expert usage helps eviction: recently used experts are more likely to be reused.
+Second, decode steps exhibit temporal locality. For fixed layer $\ell$, the active set at one generation step often overlaps with following steps, making $\mathcal{A}_{t,\ell}$ predictive of future active sets. Thus recent expert usage helps eviction: recently used experts are more likely to be reused.
 
 Third, expert choices are token- and context-dependent. Router decisions correlate with token representations and hence with request and generation-state features. \sys profiles these correlations to predict which experts are likely to be needed in upcoming layers or decode steps.
 
-Together, these properties suggest a prediction-enhanced policy: keep experts likely to be reused soon, prefetch experts predicted for future layer-step pairs, and evict inactive experts with low reuse probability.
+Together, these properties suggest a prediction-enhanced policy: keep experts likely to be reused soon and evict inactive experts with low reuse likelihood.
 
-\subsection{Prefetching and eviction}
-
-At each step $t$ and MoE layer $\ell$, \sys performs five steps. (1) Run the router and compute $\mathcal{A}_{t,\ell}$. (2) If capacity is insufficient for $\mathcal{A}_{t,\ell}\setminus \mathcal{C}^{-}_{t,\ell}$, protect the current active set and evict the lowest-score inactive experts. (3) Admit missing active experts by CPU-to-GPU copy, overlapping copies with non-expert work when possible. (4) Update the routing trace and predictor features, using online training to preserve accuracy as workloads change. (5) While this layer processes the batch, prefetch experts for future steps/layers, choose eviction victims, and replace them with CPU-to-GPU copies.
+\textbf{Prefetching and eviction.}
+%
+At each step $t$ and MoE layer $\ell$, \sys performs five steps. (1) Run the router and compute $\mathcal{A}_{t,\ell}$. (2) If capacity is insufficient for $\mathcal{A}_{t,\ell}\setminus \mathcal{C}^{-}_{t,\ell}$, protect the current active set and evict the lowest-score inactive experts. (3) Admit missing active experts by CPU-to-GPU copy, overlapping copies with non-expert work when possible. (4) Update the routing trace and predictor features, using online training to preserve accuracy as workloads change. (5) While this layer processes the batch, prefetch experts for future steps/layers, choose eviction \mbox{victims, and replace them.}
 
 \MM{I feel like we've really inflated the idea of prefetch+eviction, and then in evaluation we don't do prefetch.
 I think we need to say that earlier (intro) and repeat it here at the very start of the evaluation section, or it looks like we're burying it.}
 
+\vspace{-1mm}
 \section{Evaluation}
-Our preliminary \sysname implementation has two components: an MoE offloading engine atop vLLM~\cite{kwon2023vllm} that manages inference-time prefetching-caching, and an offline-trained lightweight predictor that ranks experts by near-future demand.
+Our preliminary \sysname prototype has two components: an MoE offloading engine atop vLLM~\cite{kwon2023vllm} that manages expert prefetching and eviction, and an offline-trained lightweight predictor that ranks \mbox{experts by near-future demand.}
 
 \begin{figure}[h!]
     \centering
+     \begin{minipage}[t]{0.6\linewidth}{
+		\vspace{-0.00in}
+		\begin{center}
+		\includegraphics[width=\textwidth, ]{figures/poster_legend.pdf}
+		\end{center}
+		}
+        \end{minipage}
+    
+    \centering
     \vspace{-0.05in}
-    \hspace{-0.15cm}
-    \subfigure[TPS/mem.]{
-        \begin{minipage}[t]{0.48\linewidth}{
+    \hspace*{-0.215cm}
+    \subfigure[TPS/memory]{
+        \begin{minipage}[t]{0.4857\linewidth}{
         \vspace{-0.00in}
         \centering
-        \includegraphics[width=0.68\textwidth]{figures/poster_tps_vs_gpu_memory.pdf}
+        \includegraphics[width=1\textwidth]{figures/poster_tps_vs_gpu_memory.pdf}
         \vspace{-0.18cm}
         }
         \label{subfig:tps-vs-gpu-memory}
         \end{minipage}
     }
     %
-    \hspace{-0.1cm}
-    \subfigure[TPS/batch]{
-        \begin{minipage}[t]{0.48\linewidth}{
+    \hspace*{-0.235cm}
+    \subfigure[TPS/batch size]{
+        \begin{minipage}[t]{0.4857\linewidth}{
         \vspace{-0.00in}
         \centering
-        \includegraphics[width=0.68\textwidth]{figures/poster_tps_vs_batch_size.pdf}
+        \includegraphics[width=1\textwidth]{figures/poster_tps_vs_batch_size.pdf}
         \vspace{-0.18cm}
         }
         \label{subfig:tps-vs-batch-size}
@@ -296,58 +315,60 @@ Our preliminary \sysname implementation has two components: an MoE offloading en
     }
 
     \vspace{-0.3cm}
-    \subfigure[TPOT/mem.]{
-        \begin{minipage}[t]{0.475\linewidth}{
+    \hspace*{-0.215cm}
+    \subfigure[TPOT/memory]{
+        \begin{minipage}[t]{0.4857\linewidth}{
         \vspace{-0.00in}
         \centering
-        \includegraphics[width=0.68\textwidth]{figures/poster_tpot_vs_gpu_memory.pdf}
+        \includegraphics[width=1\textwidth]{figures/poster_tpot_vs_gpu_memory.pdf}
         \vspace{-0.18cm}
         }
         \label{subfig:tpot-vs-gpu-memory}
         \end{minipage}
     }
     %
-    \hspace{-0.1cm}
-    \subfigure[TPOT/batch]{
-        \begin{minipage}[t]{0.475\linewidth}{
+    \hspace*{-0.235cm}
+    \subfigure[TPOT/batch size]{
+        \begin{minipage}[t]{0.4857\linewidth}{
         \vspace{-0.00in}
         \centering
-        \includegraphics[width=0.68\textwidth]{figures/poster_tpot_vs_batch_size.pdf}
+        \includegraphics[width=1\textwidth]{figures/poster_tpot_vs_batch_size.pdf}
         \vspace{-0.18cm}
         }
         \label{subfig:tpot-vs-batch-size}
         \end{minipage}
     }
 
-    \vspace{-0.2cm}
-    \caption{\sysname's throughput (TPS) and time per output token (TPOT) versus vLLM and HF. Panels (a,c) vary GPU memory at batch size $16$; panels (b,d) vary batch size with $30$GB GPU memory.}
+    \vspace{-0.35cm}
+    \caption{Throughput (TPS) and time per output token (TPOT). Figures (a,c) vary GPU memory relative to the model size (60GB) at batch size $16$; Figures (b,d) vary batch size with $30$GB GPU memory.}
     \label{fig:performance-comparison}
-    \vspace{-0.2cm}
+    \vspace{-0.35cm}
 \end{figure}
 
 \smallskip
-\subp{Evaluation setup.} We use Qwen3-30B-A3B, whose layers each have $128$ experts and activate $K_l=8$ experts per token, on MMLU-Pro~\cite{wang2024mmlupro, tigerlab2024mmluprodataset} with chain-of-thought prompting. Experiments run on a server with 8 NVIDIA RTX 6000 Ada GPUs (48 GB GDDR6 each), each connected to host CPU memory via PCIe 4.0 with 32 GB/s bidirectional bandwidth.
+\subp{Evaluation setup.} We use Qwen3-30B-A3B~\cite{qwen2025qwen330ba3b}, whose layers each have $128$ experts, each activate $8$ experts per token, the MMLU-Pro~\cite{wang2024mmlupro, tigerlab2024mmluprodataset} dataset with CoT prompting and a server with 8 NVIDIA RTX 6000 Ada GPUs (48 GB GDDR6 each), each connected to host CPU memory via PCIe 4.0 with \mbox{32 GB/s bidirectional bandwidth.}
 
 \smallskip
-\subp{Training expert predictors.}
-Predictors must be light enough for the critical path, so we restrict architecture and features. We train them offline from execution traces containing generated token embeddings and ground-truth routing logits, i.e., expert activations at every layer and decode step. Each training input uses token embeddings at $t$ and $t-1$ plus routing outputs at $t-1$; the target is the experts selected at the prediction horizon. We train two predictors for $h\in \set{0,1}$: $\mathcal{P}_{0+}$ for current-step activations and $\mathcal{P}_{1+}$ for next-step activations.
-Because each layer may activate multiple experts, we use an independent per-layer multi-label objective: the sum of binary cross-entropy terms between predicted expert probabilities and observed activation indicators. Each predictor is a small $171$MB Transformer.
+\subp{Training predictors.}
+Predictors must be light enough for the critical path, so we restrict their architecture and features. We train them offline from recorded execution traces containing generated token embeddings and ground-truth routing logits, i.e., expert activations at every layer and decode step. Each training input uses token embeddings at steps $t$ and $t-1$ plus routing outputs at $t-1$; the target is the experts selected at the prediction step $t+h$. We train two predictors for $h\in \set{0,1}$: $\mathcal{P}_{h=0}$ for current-step activations and $\mathcal{P}_{h=1}$ for next-step activations.
+As the loss function, we use the sum of binary cross-entropy terms between predicted expert probabilities and observed activation indicators. Each predictor is a small $171$MB Transformer ($0.35\%$ memory overhead each).
 
 \smallskip
 \subp{\sysname policy at inference runtime.}
-At the beginning of step $t$, for each request $b\in\mathcal{B}_t$, the predictors output per-layer scores $s^h_{b,\ell,e}$, the softmax-normalized likelihood that expert $e$ activates at layer $\ell$ at step $t+h$.\footnote{Preliminary measurements show that running the predictors at inference adds less than $1\%$ end-to-end time overhead.}
+At the beginning of step $t$, for each request $b\in\mathcal{B}_t$, the predictors output per-layer scores $s^h_{b,\ell,e}$, namely, the softmax-normalized likelihood that expert $e$ activates at layer $\ell$ at step $t+h$.%\footnote{Preliminary measurements show that running the predictors at inference adds less than $1\%$ end-to-end time overhead.}
 
-Our initial prototype focuses on eviction and uses these scores in three phases. First, for each expert, it computes $p_{\ell, e, h=0}$ and $p_{\ell, e, h=1}$, the likelihoods that the expert is required at step $t+h$.\footnote{We max-pool across the batch to order experts, compute per-horizon priors $P_h($expert is active | predicted rank $r)$, and map ranks back to experts.}
-Second, it aggregates horizons as $\bar{P}_{\ell, e} = p_{\ell, e, 0} + \lambda(1-p_{\ell, e, 0})p_{\ell, e, 1}$, with $\lambda \ge 0$ tuned to reflect lower trust in $h=1$ than $h=0$. Third, at layer $\ell$, when a cache miss occurs and the cache is full, \sysname copies missing experts ($\mathcal{A}_{t,\ell}\setminus \mathcal{C}^{-}_{t,\ell}$) from CPU to GPU and evicts non-$\mathcal{A}_{t,\ell}$ experts with the lowest $\bar{P}$ scores.
+Our initial prototype focuses on eviction and uses these scores in three phases. First, for each expert, it computes $p_{\ell, e, h=0}$ and $p_{\ell, e, h=1}$, which are the likelihoods that the expert is required at step $t+h$.
+%%\footnote{We max-pool across the batch to order experts, compute per-horizon priors $P_h($expert is active | predicted rank $r)$, and map ranks back to experts.}
+Second, it aggregates these via $\bar{P}_{\ell, e} = p_{\ell, e, 0} + \lambda(1-p_{\ell, e, 0})p_{\ell, e, 1}$, with $\lambda \ge 0$ tuned to reflect lower trust in $h=1$ over $h=0$. Third, at layer $\ell$, when an expert miss occurs and the HBM is full, \sysname copies missing experts ($\mathcal{A}_{t,\ell}\setminus \mathcal{C}^{-}_{t,\ell}$) from CPU to GPU and evicts non-$\mathcal{A}_{t,\ell}$ experts with the lowest $\bar{P}$ scores.
 
 
 
 
 \smallskip
-\subp{End to end inference performance.} Figure~\ref{fig:performance-comparison} shows that \sysname improves TPS over vLLM by $2.26 \sim 3.02\times$ and over HuggingFace by $18.23 \sim 25.18\times$ as GPU memory varies. As batch size varies, \sysname improves TPOT by $2.74 \sim 3.02\times$ and $18.23 \sim 28.62 \times$, respectively. The gains mainly come from fewer CPU-to-GPU copies: with batch size $16$ and $50\%$ GPU memory, \sysname loads $\approx2.2\%$ of experts on average, versus $\approx10.63\%$ for vLLM and $\approx 50\%$ for HF.
+\subp{End to end inference performance.} Figure~\ref{fig:performance-comparison} shows that \sysname improves TPS over vLLM by $2.26 \sim 3.02\times$ and over HuggingFace by $18.23 \sim 25.18\times$ as GPU memory varies. As batch size varies, \sysname improves TPOT by $2.74 \sim 3.02\times$ and $18.23 \sim 28.62 \times$, respectively. The gains mainly come from fewer CPU-to-GPU transfers: with batch size $16$ and $50\%$ GPU memory, \sysname loads $\approx2.2\%$ of experts on average, versus $\approx10.63\%$ for vLLM and $\approx 50\%$ for HF.
 
 \section{Future Work}
-We plan to extend the prototype from prediction-guided eviction to full prefetching and eviction. This requires modeling cache misses, false prefetches, PCIe/NVLink and other interconnect bandwidth limits, and nonuniform expert-transfer costs.
+We plan to extend our prototype from prediction-guided eviction to full prefetching and eviction. This requires modeling false prefetches, PCIe/NVLink and other interconnect bandwidth limits, and \mbox{nonuniform expert-transfer costs.}
 
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{reference}
