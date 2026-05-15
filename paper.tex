@@ -359,7 +359,7 @@ At the beginning of step $t$, for each request $b\in\mathcal{B}_t$, the predicto
 
 Our initial prototype focuses on eviction and uses these scores in three phases. First, for each expert, it computes $p_{\ell, e, h=0}$ and $p_{\ell, e, h=1}$, which are the likelihoods that the expert is required at step $t+h$.
 %%\footnote{We max-pool across the batch to order experts, compute per-horizon priors $P_h($expert is active | predicted rank $r)$, and map ranks back to experts.}
-Second, it aggregates these via $\bar{P}_{\ell, e} = p_{\ell, e, 0} + \lambda(1-p_{\ell, e, 0})p_{\ell, e, 1}$, with $\lambda \ge 0$ tuned to reflect lower trust in $h=1$ over $h=0$. Third, at layer $\ell$, when an expert miss occurs and the HBM is full, \sysname copies missing experts ($\mathcal{A}_{t,\ell}\setminus \mathcal{C}^{-}_{t,\ell}$) from CPU to GPU and evicts non-$\mathcal{A}_{t,\ell}$ experts with the lowest $\bar{P}$ scores.
+Second, it aggregates these likelihoods via $\bar{P}_{\ell, e} = p_{\ell, e, 0} + \lambda(1-p_{\ell, e, 0})p_{\ell, e, 1}$, with $\lambda \ge 0$ tuned to reflect lower trust in $h=1$ over $h=0$. Third, at layer $\ell$, when an expert miss occurs and the HBM is full, \sysname copies missing experts ($\mathcal{A}_{t,\ell}\setminus \mathcal{C}^{-}_{t,\ell}$) from CPU to GPU and evicts non-$\mathcal{A}_{t,\ell}$ experts with the lowest $\bar{P}$ scores.
 
 
 
